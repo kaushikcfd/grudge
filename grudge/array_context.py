@@ -68,6 +68,29 @@ try:
 except ImportError:
     _HAVE_SINGLE_GRID_WORK_BALANCING = False
 
+try:
+    # FIXME: temporary workaround while FusionContractorArrayContext
+    # is not available in meshmode's main branch
+    from meshmode.array_context import FusionContractorArrayContext
+
+    try:
+        # Crude check if we have the correct loopy branch
+        # (https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms)
+        from loopy.transform.loop_fusion import get_kennedy_unweighted_fusion_candidates  # noqa
+    except ImportError:
+        from warnings import warn
+        warn("Your loopy and meshmode branches are mismatched. "
+             "Please make sure that you have the "
+             "https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms "  # noqa
+             "branch of loopy.")
+        _HAVE_FUSION_ACTX = False
+    else:
+        _HAVE_FUSION_ACTX = True
+
+except ImportError:
+    _HAVE_FUSION_ACTX = False
+
+
 from arraycontext.pytest import (
         _PytestPyOpenCLArrayContextFactoryWithClass,
         _PytestPytatoPyOpenCLArrayContextFactory,
@@ -136,11 +159,38 @@ class _DistributedLazilyCompilingFunctionCaller(LazilyCompilingFunctionCaller):
             input_id_to_name_in_program, output_id_to_name_in_program,
             output_template):
 
-        from pytato.transform import deduplicate_data_wrappers
-        dict_of_named_arrays = deduplicate_data_wrappers(dict_of_named_arrays)
+        import pytato as pt
 
-        from pytato import find_distributed_partition
-        distributed_partition = find_distributed_partition(dict_of_named_arrays)
+        from meshmode.pytato_utils import unify_discretization_entity_tags
+        from pytools import ProcessLogger
+
+        dict_of_named_arrays = pt.transform.deduplicate_data_wrappers(
+            dict_of_named_arrays)
+        dict_of_named_arrays = pt.transform.materialize_with_mpms(
+            dict_of_named_arrays)
+
+        # {{{ un-materialize 0-long arrays (why would anyone want to materialize
+        # them?)
+
+        def unmaterialize_zero_long_arrays(expr):
+            if isinstance(expr, pt.Array) and expr.size == 0:
+                from pytato.tags import ImplStored
+                return expr.without_tags(ImplStored(), verify_existence=False)
+            else:
+                return expr
+
+        dict_of_named_arrays = pt.transform.map_and_copy(
+            dict_of_named_arrays,
+            unmaterialize_zero_long_arrays)
+
+        # }}}
+
+        with ProcessLogger(logger,
+                           "transform_dag.infer_axes_tags[pre-partition]"):
+            dict_of_named_arrays = unify_discretization_entity_tags(
+                dict_of_named_arrays)
+
+        distributed_partition = pt.find_distributed_partition(dict_of_named_arrays)
 
         # {{{ turn symbolic tags into globally agreed-upon integers
 
@@ -356,6 +406,18 @@ if _HAVE_SINGLE_GRID_WORK_BALANCING:
 else:
     MPIPytatoArrayContext = MPIBasePytatoPyOpenCLArrayContext
 
+
+if _HAVE_FUSION_ACTX:
+    class MPIFusionContractorArrayContext(
+            MPIPytatoArrayContextBase, FusionContractorArrayContext):
+        """
+        .. autofunction:: __init__
+        """
+
+    MPIPytatoArrayContext = MPIFusionContractorArrayContext
+else:
+    MPIPytatoArrayContext = MPIBasePytatoPyOpenCLArrayContext
+
 # }}}
 
 
@@ -388,31 +450,62 @@ register_pytest_array_context_factory("grudge.pytato-pyopencl",
 
 # {{{ actx selection
 
+
+def _get_single_grid_pytato_actx_class(distributed: bool) -> Type[ArrayContext]:
+    if not _HAVE_SINGLE_GRID_WORK_BALANCING:
+        from warnings import warn
+        warn("No device-parallel actx available, execution will be slow. "
+             "Please make sure you have the right branches for loopy "
+             "(https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms) "  # noqa
+             "and meshmode "
+             "(https://github.com/kaushikcfd/meshmode/tree/pytato-array-context-transforms).")  # noqa
+    # lazy, non-distributed
+    if not distributed:
+        if _HAVE_SINGLE_GRID_WORK_BALANCING:
+            actx_class = SingleGridWorkBalancingPytatoArrayContext
+        else:
+            actx_class = PytatoPyOpenCLArrayContext
+    # distributed+lazy:
+    if _HAVE_SINGLE_GRID_WORK_BALANCING:
+        actx_class = MPISingleGridWorkBalancingPytatoArrayContext
+    else:
+        actx_class = MPIBasePytatoPyOpenCLArrayContext
+
+    return actx_class
+
+
 def get_reasonable_array_context_class(
-        lazy: bool = True, distributed: bool = True
+        lazy: bool = True, distributed: bool = True,
+        fusion: Optional[bool] = None,
         ) -> Type[ArrayContext]:
     """Returns a reasonable :class:`PyOpenCLArrayContext` currently
     supported given the constraints of *lazy* and *distributed*."""
+    if fusion is None:
+        fusion = lazy
+
     if lazy:
-        if not _HAVE_SINGLE_GRID_WORK_BALANCING:
-            from warnings import warn
-            warn("No device-parallel actx available, execution will be slow. "
-                 "Please make sure you have the right branches for loopy "
-                 "(https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms) "  # noqa
-                 "and meshmode "
-                 "(https://github.com/kaushikcfd/meshmode/tree/pytato-array-context-transforms).")  # noqa
-        # lazy, non-distributed
-        if not distributed:
-            if _HAVE_SINGLE_GRID_WORK_BALANCING:
-                actx_class = SingleGridWorkBalancingPytatoArrayContext
+        if fusion:
+            if not _HAVE_FUSION_ACTX:
+                from warnings import warn
+                warn("No device-parallel actx available, execution will be slow. "
+                     "Please make sure you have the right branches for loopy "
+                     "(https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms) "  # noqa
+                     "and meshmode "
+                     "(https://github.com/kaushikcfd/meshmode/tree/pytato-array-context-transforms).")  # noqa
+            # lazy+fusion, non-distributed
+
+            if _HAVE_FUSION_ACTX:
+                if distributed:
+                    actx_class = MPIFusionContractorArrayContext
+                else:
+                    actx_class = FusionContractorArrayContext
             else:
-                actx_class = PytatoPyOpenCLArrayContext
-        # distributed+lazy:
-        if _HAVE_SINGLE_GRID_WORK_BALANCING:
-            actx_class = MPISingleGridWorkBalancingPytatoArrayContext
+                actx_class = _get_single_grid_pytato_actx_class(distributed)
         else:
-            actx_class = MPIBasePytatoPyOpenCLArrayContext
+            actx_class = _get_single_grid_pytato_actx_class(distributed)
     else:
+        if fusion:
+            raise ValueError("No eager actx's support op-fusion.")
         if distributed:
             actx_class = MPIPyOpenCLArrayContext
         else:
