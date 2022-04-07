@@ -57,10 +57,10 @@ try:
         from loopy.codegen.result import get_idis_for_kernel  # noqa
     except ImportError:
         from warnings import warn
-        warn("Your loopy and meshmode branches are mismatched. "
-             "Please make sure that you have the "
-             "https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms "  # noqa
-             "branch of loopy.")
+        # warn("Your loopy and meshmode branches are mismatched. "
+        #      "Please make sure that you have the "
+        #      "https://github.com/kaushikcfd/loopy/tree/pytato-array-context-transforms "  # noqa
+        #      "branch of loopy.")
         _HAVE_SINGLE_GRID_WORK_BALANCING = False
     else:
         _HAVE_SINGLE_GRID_WORK_BALANCING = True
@@ -515,7 +515,7 @@ def get_reasonable_array_context_class(
                 "device-parallel=%r",
                 actx_class.__name__, lazy, distributed,
                 # eager is always device-parallel:
-                (_HAVE_SINGLE_GRID_WORK_BALANCING or not lazy))
+                (_HAVE_SINGLE_GRID_WORK_BALANCING or _HAVE_FUSION_ACTX or not lazy))
     return actx_class
 
 # }}}
